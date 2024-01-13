@@ -55,7 +55,7 @@ def main():
     with open(root + 'cell10.pkl', 'rb') as f:
         dgl_graph = pickle.load(f)
         dgl_graph = dgl_graph[0]
-    # print(dgl_graph)
+    
     if args.task_setup == 'Disjoint':
         with open(root + 'label_tu10.pkl', 'rb') as f:
             info = pickle.load(f)
@@ -79,8 +79,6 @@ def main():
 
     config = [('GraphConv', [feat[0].shape[1], args.hidden_dim])]
 
-    # if args.h > 1:
-    # config = config + [('GraphConv', [args.hidden_dim, args.hidden_dim])] * (args.h - 1)
     config = config + [('GraphConv', [args.hidden_dim, args.hidden_dim])]
 
     config = config + [('Linear', [args.hidden_dim, labels_num])]
@@ -105,8 +103,7 @@ def main():
     print('------ Start Training ------')
     s_start = time.time()
     max_memory = 0
-    # print('maml.state_dict()',maml.state_dict())
-    # maml.eval()
+ 
     for epoch in range(args.epoch):
         # print('maml.state_dict()',maml.state_dict())
         db = DataLoader(db_train, args.task_num, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn = collate)
@@ -148,13 +145,6 @@ def main():
     torch.save(model_max.state_dict(), f'base/{args.model}.pt')
 
     db_t = DataLoader(db_test, 1, shuffle=True, num_workers=args.num_workers, pin_memory=True, collate_fn = collate)
-    # accs_all_test = []
-    # precision_all = []
-    # recall_all = []
-    # f1_all = []
-    # AUC_all = []
-    # SP_all = []
-    # mcc_all = []
     all_batch = []
     pre_label = []
     tar_label = []
@@ -179,16 +169,6 @@ def main():
                 tar_label.append(taget_l[i])
                 all_log.append(log_p[i])
     cnf_matrix = confusion_matrix(tar_label, pre_label)
-    # with open('E:\\duoladuola\\相关论文\\G-PPI-master\\Gm\\标签检查\\tar_label0011.csv', 'w', newline='') as csv_file:
-    #     writer = csv.writer(csv_file)
-    #     for item in tar_label:
-    #         writer.writerow([item])
-    #
-    # # 写入all_log到CSV文件
-    # with open('E:\\duoladuola\\相关论文\\G-PPI-master\\Gm\\标签检查\\pre_label0011.csv', 'w', newline='') as csv_file:
-    #     writer = csv.writer(csv_file)
-    #     for item in pre_label:
-    #         writer.writerow([item])
     auc_score = roc_auc_score(tar_label, all_log)
     # 从混淆矩阵中提取TN和FP
     TN = cnf_matrix[1, 1]  # 真负类别的数量
