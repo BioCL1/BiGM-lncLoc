@@ -1,3 +1,5 @@
+import csv
+
 import torch
 from torch import nn
 from torch import optim
@@ -5,10 +7,10 @@ from torch.nn import functional as F
 from torch.utils.data import TensorDataset, DataLoader
 from torch import optim
 import numpy as np
-from mlp import mlp
+from mnl import mlp
 from learner import Classifier
 from copy import deepcopy
-
+import pandas as pd
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
@@ -25,7 +27,6 @@ def euclidean_dist(x, y):
     y = y.unsqueeze(0).expand(n, m, d)
 
     return torch.pow(x - y, 2).sum(2)
-
 
 def proto_loss_spt(logits, y_t, n_support):
     target_cpu = y_t.to('cpu')  # 目标
@@ -71,7 +72,8 @@ def proto_loss_qry(logits, y_t, prototypes):
 
     dists = euclidean_dist(query_samples, prototypes)
 
-    log_p_y = F.log_softmax(-dists, dim=1).view(n_classes, n_query, -1)
+    log_p_y0 = F.log_softmax(-dists, dim=1)
+    log_p_y = log_p_y0.view(n_classes, n_query, -1)
 
     target_inds = torch.arange(0, n_classes)
     target_inds = target_inds.view(n_classes, 1, 1)
@@ -80,9 +82,7 @@ def proto_loss_qry(logits, y_t, prototypes):
     loss_val = -log_p_y.gather(2, target_inds).squeeze().view(-1).mean()
     _, y_hat = log_p_y.max(2)
     acc_val = y_hat.eq(target_inds.squeeze()).float().mean()
-
-
-    return loss_val, acc_val, target_inds.tolist(), y_hat.tolist()
+    return loss_val, acc_val, target_inds.tolist(), y_hat.tolist(), log_p_y0,query_idxs
 
 
 class Meta(nn.Module):
@@ -103,7 +103,7 @@ class Meta(nn.Module):
         self.net1 = self.net1.to(device)
         self.meta_optim = optim.Adam([{'params': self.net1.parameters()}, {'params': self.net.parameters()}],
                                      lr=self.meta_lr)
-
+        # self.method = args.method
 
     def forward_ProtoMAML(self, x_spt, y_spt, x_qry, y_qry, c_spt, c_qry, n_spt, n_qry, g_spt, g_qry, feat, gene_feat):
         """
@@ -124,19 +124,15 @@ class Meta(nn.Module):
         # print(self.net.state_dict())
 
         for i in range(task_num):
+            gene = self.net1(gene_feat)
+            gene = torch.Tensor(gene[g_spt[i][0]]).to(device)
+
             feat_spt = torch.Tensor(np.vstack(([feat[g_spt[i][j]][np.array(x)] for j, x in enumerate(n_spt[i])]))).to(
                 device)
             feat_qry = torch.Tensor(np.vstack(([feat[g_qry[i][j]][np.array(x)] for j, x in enumerate(n_qry[i])]))).to(
                 device)
-            # 1. run the i-th task and compute loss for k=0
-
-
-            gene = self.net1(gene_feat)
-            gene = torch.Tensor(gene[g_spt[i][i]]).to(device)
-
             logits, _ = self.net(x_spt[i].to(device), c_spt[i].to(device), feat_spt, vars=None)
 
-            logits = torch.add(logits, gene)
             loss, _, prototypes = proto_loss_spt(logits, y_spt[i], self.k_spt)
             losses_s[0] += loss
             grad = torch.autograd.grad(loss, self.net.parameters())
@@ -146,26 +142,22 @@ class Meta(nn.Module):
             with torch.no_grad():
                 # [setsz, nway] 输入查询集在原来GCN中得到查询集特征表达 计算与原型表达的欧氏距离 得到损失和准确率
                 logits_q, _ = self.net(x_qry[i].to(device), c_qry[i].to(device), feat_qry, self.net.parameters())
-                logits_q = torch.add(logits_q, gene)
-
-                loss_q, acc_q, _, _ = proto_loss_qry(logits_q, y_qry[i], prototypes)
+                loss_q, acc_q, _, _,_,_ = proto_loss_qry(logits_q, y_qry[i], prototypes)
                 losses_q[0] += loss_q
                 corrects[0] = corrects[0] + acc_q
 
             # this is the loss and accuracy after the first update
             with torch.no_grad():  # 输入查询集在更新后GCN中得到查询集特征表达 计算与原型表达的欧氏距离 得到损失和准确率
                 logits_q, _ = self.net(x_qry[i].to(device), c_qry[i].to(device), feat_qry, fast_weights)
-                logits_q = torch.add(logits_q, gene)
-
-                loss_q, acc_q, _, _ = proto_loss_qry(logits_q, y_qry[i], prototypes)
+                loss_q, acc_q, _, _,_,_ = proto_loss_qry(logits_q, y_qry[i], prototypes)
                 losses_q[1] += loss_q
                 corrects[1] = corrects[1] + acc_q
 
+            feat_spt = torch.add(feat_spt, gene)
+            feat_qry = torch.add(feat_qry, gene)
             for k in range(1, self.update_step):
                 # 1. run the i-th task and compute loss for k=1~K-1  输入支持集在更新后GCN中得到查询集特征表达 计算原型表达 得到损失和准确率
                 logits, _ = self.net(x_spt[i].to(device), c_spt[i].to(device), feat_spt, fast_weights)
-                logits = torch.add(logits, gene)
-
                 loss, _, prototypes = proto_loss_spt(logits, y_spt[i], self.k_spt)
                 losses_s[k] += loss
                 # 2. compute grad on theta_pi 梯度返回更新
@@ -173,10 +165,9 @@ class Meta(nn.Module):
                 # 3. theta_pi = theta_pi - train_lr * grad 参数更新 输入查询集在更新后GCN中得到查询集特征表达 计算与原型表达的欧氏距离 得到损失和准确率
                 fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, fast_weights)))
                 logits_q, _ = self.net(x_qry[i].to(device), c_qry[i].to(device), feat_qry, fast_weights)
-                logits_q = torch.add(logits_q, gene)
 
                 # loss_q will be overwritten and just keep the loss_q on last update step.
-                loss_q, acc_q, taget_label, pre_label = proto_loss_qry(logits_q, y_qry[i], prototypes)
+                loss_q, acc_q, taget_label, pre_label,_,_ = proto_loss_qry(logits_q, y_qry[i], prototypes)
                 losses_q[k + 1] += loss_q
                 corrects[k + 1] = corrects[k + 1] + acc_q
         # end of all tasks
@@ -198,8 +189,7 @@ class Meta(nn.Module):
     def fine_MAML(self, x_spt, y_spt, x_qry, y_qry, c_spt, c_qry, n_spt, n_qry, g_spt, g_qry, feat,
                               gene_feat):
         querysz = len(y_qry[0])
-
-
+        corrects = [0 for _ in range(self.update_step_test + 1)]
         # finetunning on the copied model instead of self.net
         net = deepcopy(self.net)
         x_spt = x_spt[0]
@@ -218,26 +208,25 @@ class Meta(nn.Module):
 
         # 1. run the i-th task and compute loss for k=0
         gene = self.net1(gene_feat)
-        np.savetxt('E:/duoladuola/相关论文/G-PPI-master/cell_line/gene/gene.csv', gene.detach().numpy(), fmt='%.2f', delimiter=',')
-        print(type(gene),gene.shape)
 
         for j, _ in enumerate(n_spt):
             gene0 = torch.Tensor(gene[g_spt[j]]).to(device)
+        feat_spt = torch.add(feat_spt, gene0)
+        feat_qry = torch.add(feat_qry, gene0)
+
 
         logits, _ = net(x_spt.to(device), c_spt.to(device), feat_spt)
-        logits = torch.add(logits, gene0)
 
         loss, _, prototypes = proto_loss_spt(logits, y_spt, self.k_spt)
 
         logits_q, _ = net(x_qry.to(device), c_qry.to(device), feat_qry, net.parameters())
-        logits_q = torch.add(logits_q, gene0)
 
-        loss_q, acc_q,taget_label, pre_label = proto_loss_qry(logits_q, y_qry, prototypes)
+        loss_q, acc_q,taget_label, pre_label, log_p_y0,query_idxs = proto_loss_qry(logits_q, y_qry, prototypes)
         accs = np.array(acc_q)
         taget_label_list = torch.tensor(np.array(taget_label).flatten())
         pre_label_list = torch.tensor(np.array(pre_label).flatten())
-
-        return accs,taget_label_list,pre_label_list
+        log_p_y0 = log_p_y0[:, 1].detach()
+        return accs,taget_label_list,pre_label_list,log_p_y0,query_idxs
 
 
 
@@ -249,9 +238,9 @@ class Meta(nn.Module):
 
     def fine(self, x_spt, y_spt, x_qry, y_qry, c_spt, c_qry, n_spt, n_qry, g_spt, g_qry, feat, gene_feat):
         # if self.method == 'G-Meta':
-        accs,taget_label_list,pre_label_list = self.fine_MAML(x_spt, y_spt, x_qry, y_qry, c_spt, c_qry, n_spt, n_qry, g_spt, g_qry, feat,
+        accs,taget_label_list,pre_label_list,log_p_y0,query_idxs = self.fine_MAML(x_spt, y_spt, x_qry, y_qry, c_spt, c_qry, n_spt, n_qry, g_spt, g_qry, feat,
                                           gene_feat)
-        return accs,taget_label_list,pre_label_list
+        return accs,taget_label_list,pre_label_list,log_p_y0,query_idxs
 
 
 
